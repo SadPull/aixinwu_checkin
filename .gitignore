@@ -1,0 +1,44 @@
+# 本地凭据 / 参考项目（含真实账号与浏览器资料目录，切勿提交）
+config.py
+.env
+.env.*
+!.env.example
+auto-aixinwu-sjtu-main/
+data0/
+
+# 抓包与调查期临时文件（含明文密码 / token）
+*.har
+muts.json
+schema_full.json
+bearer
+bearer.txt
+cj.txt
+jlogin.html
+
+# 运行期产物
+captcha.jpg
+captcha_*.png
+probe.png
+clean_*.png
+last_res*
+*.mhtml
+
+# 参考资料（本地留存，不进交付库）
+captcha.js
+c-users-*-aixinwu-checkin-*.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
