@@ -122,6 +122,10 @@ class PermanentAuthError(Exception):
     """账号/密码错误或被锁定——不应重试。"""
 
 
+class RetryableAuthError(Exception):
+    """验证码、Cookie 或 OAuth 回跳的瞬时失败——可以用新会话重试。"""
+
+
 # ---------------------------------------------------------------------------
 # 工具
 # ---------------------------------------------------------------------------
@@ -288,16 +292,38 @@ def _exchange_token(session, code, state):
     return token, node.get("user") or {}
 
 
-def _fetch_code(session, next_url):
-    """步骤 5：带 JAAuthCookie 跟随回跳链，从落地 URL 取 OAuth code。"""
+def _fetch_code(session, next_url, referer):
+    """步骤 5：带 JAAuthCookie 手动跟随回跳链，从 Location 取 OAuth code。"""
     url = urljoin(JACCOUNT, next_url)
-    resp = session.get(url, allow_redirects=True, timeout=30)
-    for hop in [resp] + list(resp.history):
-        code_list = parse_qs(urlparse(hop.url).query).get("code")
+    headers = {
+        "Referer": referer,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
+        ),
+    }
+
+    # 不自动跟随：授权码通常出现在跨站 302 的 Location 中，直接截取更稳定，
+    # 也避免把短期 code 继续带到不必要的页面或错误日志。
+    for _hop in range(10):
+        code_list = parse_qs(urlparse(url).query).get("code")
         if code_list:
             return code_list[0]
-    safe_url = urlparse(resp.url)._replace(query="", fragment="").geturl()
-    raise RuntimeError(f"回跳链未取到 code（落地地址: {safe_url}）")
+
+        resp = session.get(url, headers=headers, allow_redirects=False, timeout=30)
+        location = resp.headers.get("Location")
+        if location:
+            headers["Referer"] = urlparse(url)._replace(query="", fragment="").geturl()
+            url = urljoin(url, location)
+            continue
+
+        if urlparse(resp.url).path.rstrip("/").endswith("/jaccount/jalogin"):
+            raise RetryableAuthError("OAuth 回跳重新落到登录页，登录 Cookie 未生效")
+        raise RetryableAuthError(
+            f"OAuth 回跳未返回授权码（HTTP {resp.status_code}）"
+        )
+
+    raise RetryableAuthError("OAuth 回跳次数过多，未返回授权码")
 
 
 def _attempt_once(session):
@@ -329,7 +355,7 @@ def _attempt_once(session):
         "captcha": captcha,
         "lt": "p",
     }
-    resp = session.post(
+    login_resp = session.post(
         ULOGIN_URL,
         data=form,
         headers={
@@ -338,7 +364,9 @@ def _attempt_once(session):
             "X-Requested-With": "XMLHttpRequest",
         },
         timeout=30,
-    ).json()
+    )
+    login_resp.raise_for_status()
+    resp = login_resp.json()
 
     if resp.get("errno") != 0:
         err = resp.get("error") or f"errno={resp.get('errno')}"
@@ -348,7 +376,20 @@ def _attempt_once(session):
         log.warning("验证码校验失败: %s", _safe_error(err))
         return None
 
-    code = _fetch_code(session, resp["url"])
+    if not any(cookie.name == "JAAuthCookie" for cookie in session.cookies):
+        log.warning("JAccount 登录响应未下发认证 Cookie，将使用新会话重试")
+        return None
+
+    next_url = resp.get("url")
+    if not next_url:
+        log.warning("JAccount 登录响应缺少回跳地址，将使用新会话重试")
+        return None
+
+    try:
+        code = _fetch_code(session, next_url, jalogin_url)
+    except RetryableAuthError as e:
+        log.warning("%s，将使用新会话重试", _safe_error(e))
+        return None
     token, _user = _exchange_token(session, code, state)
     return token
 

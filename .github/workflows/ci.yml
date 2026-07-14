@@ -26,4 +26,9 @@ jobs:
       - name: 检查 Python 语法
         env:
           PYTHONDONTWRITEBYTECODE: "1"
-        run: python -m py_compile aixinwu.py notify.py config_template.py
+        run: python -m py_compile aixinwu.py notify.py config_template.py tests/test_auth_flow.py
+
+      - name: 运行认证流程回归测试
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests -v
