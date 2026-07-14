@@ -1,11 +1,12 @@
 # 爱心屋每日自动签到
 
 通过 GitHub Actions 定时完成上海交通大学爱心屋登录签到，可选通过 PushPlus 推送结果。
-仓库源码可以公开，但真实 JAccount 凭据必须只保存在 GitHub Actions Secrets 中。
+仓库源码可以公开，但真实 JAccount Cookie、账号和密码必须只保存在 GitHub Actions
+Secrets 中。
 
 ## 安全设计
 
-- 源码和配置模板不包含真实账号、密码或 token。
+- 源码和配置模板不包含真实 Cookie、账号、密码或 token。
 - 签到工作流只支持定时运行和手动运行，不会在 Pull Request 中使用 Secrets。
 - GitHub Token 权限限制为 `contents: read`，检出完成后不保留 Git 凭据。
 - 官方 GitHub Actions 固定到具体提交，Python 依赖固定版本并由 Dependabot 检查更新。
@@ -46,14 +47,33 @@ git ls-files | rg '(\.har$|config\.py$|\.env$|captcha\.js$|__pycache__|\.pyc$)'
 
 | Secret 名 | 必填 | 说明 |
 |---|---:|---|
-| `AIXINWU_USERNAME` | 是 | JAccount 用户名 |
-| `AIXINWU_PASSWORD` | 是 | JAccount 密码 |
+| `AIXINWU_JACCOUNT_COOKIE` | 二选一 | 推荐；仅填写本地浏览器中的 `JAAuthCookie` 值 |
+| `AIXINWU_USERNAME` | 二选一 | 未使用 Cookie 模式时填写 JAccount 用户名 |
+| `AIXINWU_PASSWORD` | 二选一 | 未使用 Cookie 模式时与用户名一起填写 |
 | `PUSHPLUS_TOKEN` | 否 | PushPlus token；不配置则不推送 |
+
+登录配置有两种模式：推荐只配置 `AIXINWU_JACCOUNT_COOKIE`；或者不配置 Cookie，改为同时
+配置用户名和密码。如果三项都存在，Cookie 模式优先；Cookie 失效后任务会直接失败并提醒，
+不会自动回退密码登录。
+
+### 3. 获取 JAAuthCookie（推荐模式）
+
+1. 在自己的电脑上用浏览器正常登录 JAccount 并进入爱心屋。
+2. 打开浏览器开发者工具，在 Application（应用）/ Storage（存储）的 Cookies 中选择
+   `https://jaccount.sjtu.edu.cn`。
+3. 只复制名为 `JAAuthCookie` 的 Cookie 值，保存为 Repository Secret
+   `AIXINWU_JACCOUNT_COOKIE`。
+4. 不要复制完整 Cookie Header，不要保存 `JSESSIONID`、`JAVisitedSites`、`refreshToken`，
+   也不要上传 HAR 抓包。
+
+`JAAuthCookie` 可直接代表登录状态，敏感程度不低于密码。其有效期由 JAccount 决定；失效
+或被异地风控拒绝后，需要回到本地重新登录并更新 Secret。GitHub 托管 Runner 的出口 IP
+会变化，因此该方案只能减少重复登录，不能保证绕过异地验证。
 
 不要把这些值配置成普通 GitHub Variables，也不要写入 workflow、README、Issue 或 Actions
 日志。Secrets 的值在工作流中通过环境变量注入，源码不会保存它们。
 
-### 3. 启用并验证
+### 4. 启用并验证
 
 打开仓库的 Actions 页面，选择“爱心屋签到”，点击 `Run workflow` 手动运行一次。
 验证成功后，工作流每天按北京时间约 09:13 和 17:13 各运行一次，第二次运行用于降低
@@ -64,7 +84,14 @@ git ls-files | rg '(\.har$|config\.py$|\.env$|captcha\.js$|__pycache__|\.pyc$)'
 
 ## 工作原理
 
-脚本使用 `requests.Session` 完成 JAccount OIDC 登录：
+脚本使用 `requests.Session` 完成 JAccount OIDC 登录。配置 Cookie 时：
+
+1. 从爱心屋接口获取 JAccount 授权地址和 OIDC state。
+2. 将 `JAAuthCookie` 仅绑定到 `jaccount.sjtu.edu.cn`，手动跟随授权重定向取得 code。
+3. 交换爱心屋 access token 并查询签到结果。
+4. 若重定向落到登录页或附加验证页，立即失败并提醒更新 Cookie，不提交账号密码。
+
+未配置 Cookie 时保留原有账号密码流程：
 
 1. 从爱心屋接口获取 JAccount 授权地址和 OIDC state。
 2. 进入 JAccount 登录页，解析登录表单参数和验证码会话 UUID。
@@ -85,7 +112,8 @@ python -m pip install -r requirements.txt
 Copy-Item config_template.py config.py
 ```
 
-然后只在本地编辑 `config.py` 填入真实值并运行：
+然后只在本地编辑 `config.py`，选择填写 `AIXINWU_JACCOUNT_COOKIE`，或填写用户名和密码，
+再运行：
 
 ```powershell
 python aixinwu.py
@@ -98,16 +126,19 @@ GitHub Actions 中启用或上传这些文件。
 
 ## 常见问题
 
-- 缺少账号或密码：检查 Repository secrets 名称是否完全一致。
+- 缺少登录配置：检查 Cookie Secret，或用户名与密码两个 Secrets 是否完整配置。
+- Cookie 会话失效或被风控拒绝：在本地重新登录并更新 `AIXINWU_JACCOUNT_COOKIE`；脚本不会
+  自动回退密码登录。
 - 账号或密码错误：脚本会停止重试，避免连续失败触发账号锁定。
 - 验证码偶发失败：脚本会使用新会话重试，最多尝试 5 次。
-- OAuth 回跳重新进入登录页：通常是认证 Cookie 瞬时未生效，脚本会自动换新会话重试。
+- OAuth 回跳重新进入登录页：账号密码模式会换新会话重试；Cookie 模式会立即停止并要求更新
+  `AIXINWU_JACCOUNT_COOKIE`。
 - PushPlus 没有消息：确认 `PUSHPLUS_TOKEN` 已配置；未配置时会静默跳过。
 - 定时任务没有运行：GitHub 可能延迟 schedule，长期无仓库活动时也可能暂停定时工作流。
 
 ## 安全事件处理
 
-如果真实密码、token 或 HAR 抓包曾被提交，即使随后删除，敏感内容仍可能存在于 Git
+如果真实 Cookie、密码、token 或 HAR 抓包曾被提交，即使随后删除，敏感内容仍可能存在于 Git
 历史中。请立即轮换相关凭据并清理历史。更多说明见 [SECURITY.md](SECURITY.md)。
 
 ## 免责声明

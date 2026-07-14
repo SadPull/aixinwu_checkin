@@ -18,8 +18,9 @@ CONSECUTIVE_LOGIN 发放爱心币。整条链路（经 HAR 抓包 + 真机逐请
 否则 jaccount 校验的是另一张图，识别再准也判错。OCR 用交大 geek ResNet 在线识别
 （专为 jaccount 训练，高精度）为主，本地 ddddocr 离线兜底。
 
-配置来源：环境变量优先（AIXINWU_USERNAME / AIXINWU_PASSWORD / PUSHPLUS_TOKEN），
-本地缺省回落 config.py。成功退出 0，失败退出非 0。
+配置来源：环境变量优先（AIXINWU_JACCOUNT_COOKIE，或 AIXINWU_USERNAME /
+AIXINWU_PASSWORD；PUSHPLUS_TOKEN 可选），本地缺省回落 config.py。Cookie 存在时优先使用，
+失效后不会回退密码登录。成功退出 0，失败退出非 0。
 """
 
 import json
@@ -64,6 +65,7 @@ def _cfg(name, default=None):
 
 USERNAME = _cfg("AIXINWU_USERNAME")
 PASSWORD = _cfg("AIXINWU_PASSWORD")
+JACCOUNT_COOKIE = _cfg("AIXINWU_JACCOUNT_COOKIE")
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -124,6 +126,10 @@ class PermanentAuthError(Exception):
 
 class RetryableAuthError(Exception):
     """验证码、Cookie 或 OAuth 回跳的瞬时失败——可以用新会话重试。"""
+
+
+class CookieSessionError(Exception):
+    """预置的 JAccount 会话失效或被风控拒绝——不得回退密码登录。"""
 
 
 # ---------------------------------------------------------------------------
@@ -394,8 +400,44 @@ def _attempt_once(session):
     return token
 
 
-def login():
-    """多次尝试登录（每次全新会话跑完整链路），返回 access token。"""
+def _attempt_cookie_login(session, cookie_value):
+    """使用本地导出的 JAAuthCookie 完成 SSO，不提交账号、密码或验证码。"""
+    cookie_value = str(cookie_value or "").strip()
+    if (
+        not cookie_value
+        or cookie_value.lower().startswith("jaauthcookie=")
+        or re.search(r"[;\r\n]", cookie_value)
+    ):
+        raise CookieSessionError(
+            "AIXINWU_JACCOUNT_COOKIE 格式错误，只能填写 JAAuthCookie 的值"
+        )
+    session.cookies.set(
+        "JAAuthCookie",
+        cookie_value,
+        domain="jaccount.sjtu.edu.cn",
+        path="/",
+        secure=True,
+    )
+    authorization_url, state = _get_authorization_url(session)
+    try:
+        code = _fetch_code(
+            session,
+            authorization_url,
+            "https://aixinwu.sjtu.edu.cn/",
+        )
+    except RetryableAuthError as exc:
+        raise CookieSessionError(
+            "JAccount 会话失效或被风控拒绝，请在本地重新登录并更新 "
+            "AIXINWU_JACCOUNT_COOKIE"
+        ) from exc
+
+    token, _user = _exchange_token(session, code, state)
+    log.info("JAccount Cookie 会话登录成功（登录=签到完成）")
+    return token
+
+
+def _login_with_password():
+    """多次尝试账号密码登录（每次全新会话跑完整链路）。"""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         session = new_session()
         token = _attempt_once(session)  # PermanentAuthError 直接向上抛
@@ -404,6 +446,13 @@ def login():
             return token
         log.info("第 %d 次尝试未通过，重试", attempt)
     raise RuntimeError(f"登录重试 {MAX_ATTEMPTS} 次仍失败（验证码/网络）")
+
+
+def login():
+    """Cookie 优先登录；Cookie 失效时安全失败，不回退账号密码。"""
+    if JACCOUNT_COOKIE:
+        return _attempt_cookie_login(new_session(), JACCOUNT_COOKIE)
+    return _login_with_password()
 
 
 def get_me(token):
@@ -438,11 +487,16 @@ def _notify(title, content):
 def _safe_error(err):
     """清除错误文本中可能进入公开 Actions 日志的凭据和 URL 查询参数。"""
     text = str(err)
-    for name in ("AIXINWU_USERNAME", "AIXINWU_PASSWORD", "PUSHPLUS_TOKEN"):
+    for name in (
+        "AIXINWU_USERNAME",
+        "AIXINWU_PASSWORD",
+        "AIXINWU_JACCOUNT_COOKIE",
+        "PUSHPLUS_TOKEN",
+    ):
         value = os.environ.get(name)
         if value:
             text = text.replace(value, "[REDACTED]")
-    for value in (USERNAME, PASSWORD):
+    for value in (USERNAME, PASSWORD, JACCOUNT_COOKIE):
         if value:
             text = text.replace(str(value), "[REDACTED]")
     text = re.sub(
@@ -486,8 +540,11 @@ def report_failure(err):
 
 
 def main():
-    if not USERNAME or not PASSWORD:
-        report_failure("缺少 AIXINWU_USERNAME / AIXINWU_PASSWORD 配置")
+    if not JACCOUNT_COOKIE and (not USERNAME or not PASSWORD):
+        report_failure(
+            "缺少登录配置：请设置 AIXINWU_JACCOUNT_COOKIE，或同时设置 "
+            "AIXINWU_USERNAME / AIXINWU_PASSWORD"
+        )
         return 1
     try:
         token = login()
