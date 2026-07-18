@@ -1,0 +1,2 @@
+# 确保 shell 脚本在任何平台检出都用 LF，避免 Windows 提交后在 VPS 上因 CRLF 执行失败
+*.sh text eol=lf
